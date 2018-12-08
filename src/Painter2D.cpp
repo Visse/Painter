@@ -1,4 +1,4 @@
-#include "Painter2D.h"
+#include "Painter/Painter2D.h"
 
 #include <new>
 #include <vector>
@@ -12,6 +12,10 @@ namespace Painter
         struct Painter2D {
             std::vector<Vertex> vertexes;
             std::vector<IndexType> indexes;
+            
+            std::vector<MeshSection> sections;
+            MeshSection currentSection;
+            bool isDrawing = false;
         };
         
         template< int MaxSize, int MaxAlign, int Size, int Align >
@@ -29,37 +33,88 @@ namespace Painter
             mesh.indexes = impl->indexes.data();
             mesh.indexCount = impl->indexes.size();
             
+            mesh.sections = impl->sections.data();
+            mesh.sectionCount = impl->sections.size();
             return mesh;
+        }
+        
+        // Called at the start of any draw command
+        void begin_draw( Painter2D *impl )
+        {
+            assert (impl->isDrawing == false);
+            impl->isDrawing = true;
+            impl->currentSection.firstVertex = impl->vertexes.size();
+            impl->currentSection.vertexCount = 0;
+            impl->currentSection.firstIndex = impl->indexes.size();
+            impl->currentSection.indexCount = 0;
+        }
+        
+        // Called at the end of any draw command
+        void end_draw( Painter2D *impl )
+        {
+            assert (impl->isDrawing == true);
+            impl->isDrawing = false;
+            // can we merge the two sections?
+            if (impl->sections.empty() == false) {
+                MeshSection &lastSection = impl->sections.back();
+                if ((lastSection.vertexCount + impl->currentSection.vertexCount) < std::numeric_limits<IndexType>::max()) {
+                    // Yes - merge the sections
+                    
+                    IndexType offset = lastSection.vertexCount;
+                    lastSection.vertexCount += impl->currentSection.vertexCount;
+                    lastSection.indexCount += impl->currentSection.indexCount;
+                    
+                    // Fix indexes
+                    size_t base = impl->currentSection.firstIndex;
+                    for (size_t i=0; i < impl->currentSection.indexCount; ++i) {
+                        impl->indexes[base + i] += offset;
+                    }
+                    return;
+                }
+            }
+            
+            // Failed to merge - add a new section
+            impl->sections.push_back(impl->currentSection);
         }
         
         void reserve_indexes( Painter2D *impl, unsigned count )
         {
+            assert (impl->isDrawing == true);
         }
         
         IndexType push_vertexes( Painter2D *impl, const Vertex *vertexes, unsigned count )
         {
-            size_t base = impl->vertexes.size();
+            assert (impl->isDrawing == true);
+            
+            size_t base = impl->currentSection.vertexCount;
+            impl->currentSection.vertexCount += count;
+            assert (impl->currentSection.vertexCount < std::numeric_limits<IndexType>::max());
             
             impl->vertexes.insert(impl->vertexes.end(), vertexes, vertexes+count);
             
-            assert ((base + count) < std::numeric_limits<IndexType>::max());
             return base;
         }
         
-        IndexType push_vertexes( Painter2D *impl, const Vertex *vertexes, unsigned vertexCount, const IndexType *indexes, unsigned count )
+        void push_indexes( Painter2D *impl, const IndexType *indexes, unsigned count, IndexType base )
         {
-            IndexType base = push_vertexes(impl, vertexes, vertexCount);
-            
-            reserve_indexes(impl, count);
-            for (unsigned i=0; i < count; ++i) {
-                impl->indexes.push_back(base + indexes[i]);
+            assert (impl->isDrawing == true);
+            impl->currentSection.indexCount += count;
+            for (size_t i=0; i < count; ++i) {
+                impl->indexes.push_back(indexes[i] + base);
             }
-            
+        }
+        
+        IndexType push_vertexes( Painter2D *impl, const Vertex *vertexes, unsigned vertexCount, const IndexType *indexes, unsigned indexCount )
+        {
+            assert (impl->isDrawing == true);
+            IndexType base = push_vertexes(impl, vertexes, vertexCount);
+            push_indexes(impl, indexes, indexCount, base);
             return base;
         }
         
         void draw_quad( Painter2D *impl, Vec2 origin, Vec2 v1, Vec2 v2, Color color )
         {
+            begin_draw(impl);
             //      v1
             //    0 --- 1
             // v2 |  \  |
@@ -75,26 +130,33 @@ namespace Painter
                 0, 3, 2
             };
             push_vertexes(impl, vertexes, 4, indexes, 6);
+            end_draw(impl);
         }
         
         void draw_convex_polygon( Painter2D *impl, const Vertex *vertexes, unsigned count )
         {
+            if (count < 3) return;
+            
+            begin_draw(impl);
             IndexType base = push_vertexes(impl, vertexes, count);
             
             unsigned triangleCount = count - 2;
             unsigned indexCount = triangleCount * 3;
             
             reserve_indexes(impl, indexCount);
-            for (unsigned i=0; i < triangleCount; ++i) {
-                impl->indexes.push_back(base + 0);
-                impl->indexes.push_back(base + 1 + i);
-                impl->indexes.push_back(base + 2 + i);
+            for (IndexType i=0; i < triangleCount; ++i) {
+                IndexType triangle[3] = {
+                    0, IndexType(1 + i), IndexType(2 +i)
+                };
+                push_indexes(impl, triangle, 3, base);
             }
+            end_draw(impl);
         }
         
         
         void draw_segment( Painter2D *impl, PolyLineControllPoint p1, PolyLineControllPoint p2, CapType cap1, CapType cap2 )
         {
+            begin_draw(impl);
             Vec2 dir = p1.pos - p2.pos;
             if (isZero(dir)) return;
             
@@ -115,11 +177,12 @@ namespace Painter
             };
             
             push_vertexes(impl, v, 4, indexes, 6);
+            end_draw(impl);
         }
         
         
         // Draw a cap on p1
-        void draw_cap( Painter2D *impl, Vec2 pos, Vec2 dir, CapType cap ) {
+        void polyline_cap( Painter2D *impl, Vec2 pos, Vec2 dir, CapType cap ) {
             /*
             if (cap == CapType::Butt) return;
             
@@ -261,8 +324,7 @@ namespace Painter
                 miter.v2, 
                 miter.v4
             };
-            
-            impl->indexes.insert(impl->indexes.end(), std::begin(indexes), std::end(indexes));
+            push_indexes(impl, indexes, 3, 0);
         }
         
         void polyline_achor_round( Painter2D *impl, const PolylineAchor &achor ) {
@@ -437,6 +499,7 @@ namespace Painter
                 return draw_segment(impl, points[0], points[1], options.startCap, options.endCap);
             }
             
+            begin_draw(impl);
             /// @todo caps
             for (int i=2; i < count; ++i) {
                 PolyLineControllPoint p1 = points[i-2];
@@ -456,6 +519,7 @@ namespace Painter
                 
                 polyline_achor(impl, p1, p2, p3, options.joint);
             }
+            end_draw(impl);
         }
         
         void draw_polyloop( Painter2D *impl, const PolyLineControllPoint *points, unsigned count, PolyloopOptions options )
@@ -465,6 +529,7 @@ namespace Painter
                 return draw_segment(impl, points[0], points[1], CapType::Butt, CapType::Butt);
             }
             
+            begin_draw(impl);
             for (int i=0; i < count; ++i) {
                 PolyLineControllPoint p1 = points[((i-2) + count) % count];
                 PolyLineControllPoint p2 = points[((i-1) + count) % count];
@@ -480,6 +545,7 @@ namespace Painter
                 
                 polyline_achor(impl, p1, p2, p3, options.joint);
             }
+            end_draw(impl);
         }
     }
     
@@ -494,7 +560,7 @@ namespace Painter
 
     Painter2D::Painter2D()
     {
-        internal::CheckImpl<IMPL_SIZE, alignof(mImpl), sizeof(Impl), alignof(Impl)>();
+        internal::CheckImpl<IMPL_SIZE, alignof(decltype(mImpl)), sizeof(Impl), alignof(Impl)>();
         new (impl()) Impl;
     }
     
@@ -510,6 +576,14 @@ namespace Painter
     
     void Painter::Painter2D::drawQuad( Vec2 origin, Vec2 v1, Vec2 v2, Color color )
     {
+        return internal::draw_quad(impl(), origin, v1, v2, color);
+    }
+    
+    void Painter::Painter2D::drawQuadAA( Vec2 origin, Vec2 halfSize, Color color )
+    {
+        Vec2 v1 = Vec2(1.f,0.f) * halfSize.x,
+             v2 = Vec2(0.f,1.f) * halfSize.y;
+        
         return internal::draw_quad(impl(), origin, v1, v2, color);
     }
     
@@ -539,6 +613,17 @@ namespace Painter
         
         return drawConvexPolygon(vertexes.data(), vertexes.size());
     }
+    
+    
+    void Painter2D::drawConvexPolygon( std::initializer_list<Vertex> vertexes )
+    {
+        return drawConvexPolygon(vertexes.begin(), vertexes.size());
+    }
+    
+    void Painter2D::drawConvexPolygon( std::initializer_list<Vec2> positions, Color color )
+    {
+        return drawConvexPolygon(positions.begin(), positions.size(), color);
+    }
 
     void Painter2D::drawPolyLine( const PolyLineControllPoint *controllPoints, unsigned count, PolylineOptions options )
     {
@@ -565,12 +650,22 @@ namespace Painter
         return drawPolyLine(controllPoints.data(), count, options);
     }
     
-    void Painter2D::drawPolyLoop(const Painter::PolyLineControllPoint* controllPoints, unsigned int count, Painter::PolyloopOptions options)
+    void Painter2D::drawPolyLoop( const Painter::PolyLineControllPoint* controllPoints, unsigned int count, Painter::PolyloopOptions options )
     {
         return internal::draw_polyloop(impl(), controllPoints, count, options);
     }
+    
+    void Painter2D::drawPolyLine( std::initializer_list<PolyLineControllPoint> controllPoints, PolylineOptions options)
+    {
+        return drawPolyLine(controllPoints.begin(), controllPoints.size(), options);
+    }
+    
+    void Painter2D::drawPolyLine( std::initializer_list<Vec2> positions, Color color, float thickness, PolylineOptions options )
+    {
+        return drawPolyLine(positions.begin(), positions.size(), color, thickness, options);
+    }
 
-    void Painter::Painter2D::drawPolyLoop(const Painter::Vec2* positions, unsigned int count, Painter::Color color, float thickness, Painter::PolyloopOptions options)
+    void Painter2D::drawPolyLoop(const Painter::Vec2* positions, unsigned int count, Painter::Color color, float thickness, Painter::PolyloopOptions options)
     {
         if (count < SMALL_VECTOR_OPTIMIZATION) {
             PolyLineControllPoint controllPoints[SMALL_VECTOR_OPTIMIZATION];
@@ -590,7 +685,15 @@ namespace Painter
         
         return drawPolyLoop(controllPoints.data(), count, options);
     }
+    
+    void Painter2D::drawPolyLoop( std::initializer_list<PolyLineControllPoint> controllPoints, PolyloopOptions options )
+    {
+        return drawPolyLoop(controllPoints.begin(), controllPoints.size(), options);
+    }
+    
+    void Painter2D::drawPolyLoop( std::initializer_list<Vec2> positions, Color color, float thickness, PolyloopOptions options )
+    {
+        return drawPolyLoop(positions.begin(), positions.size(), color, thickness, options);
+    }
 }
-
-
 
